@@ -15,14 +15,14 @@ az network vnet create \
 --name $AKS_VNET \
 --address-prefixes 10.0.0.0/8 \
 --subnet-name $AKS_SUBNET \
---subnet-prefixes 10.240.0.0/24
+--subnet-prefixes 10.10.0.0/16
 
 # Create a subnet for the Private Links
 az network vnet subnet create \
 --resource-group $RESOURCE_GROUP \
 --vnet-name $AKS_VNET \
 --name $PLS_SUBNET \
---address-prefixes 10.241.0.0/24
+--address-prefixes 10.20.0.0/24
 
 # Create user identity for the AKS cluster
 az identity create --name $AKS_CLUSTER_NAME-identity --resource-group $RESOURCE_GROUP
@@ -177,7 +177,7 @@ metadata:
     service.beta.kubernetes.io/azure-pls-name: traefik-lb-private-link 
     service.beta.kubernetes.io/azure-pls-ip-configuration-subnet: "$PLS_SUBNET" # Private Link subnet name
     service.beta.kubernetes.io/azure-pls-ip-configuration-ip-address-count: "1"
-    service.beta.kubernetes.io/azure-pls-ip-configuration-ip-address: 10.241.0.10
+    service.beta.kubernetes.io/azure-pls-ip-configuration-ip-address: 10.20.0.10
     service.beta.kubernetes.io/azure-pls-visibility: "*"    
 spec:
   type: LoadBalancer
@@ -277,7 +277,10 @@ kubectl logs -f $(kubectl get pods -l app=traefik -o jsonpath='{.items[0].metada
 # Test access whoami internally
 kubectl run -it --rm aks-ingress-test --image=mcr.microsoft.com/aks/fundamental/base-ubuntu:v0.0.11
 apt-get update && apt-get install -y curl
-curl http://10.240.0.7
+# Directly to the service
+curl http://whoami
+# Through the ingress
+curl http:/traefik-web-service/
 exit
 
 ##### Test private link service from a vm #####
@@ -287,7 +290,10 @@ az network vnet subnet create \
 --resource-group $RESOURCE_GROUP \
 --vnet-name $AKS_VNET \
 --name $VM_SUBNET \
---address-prefixes 10.242.0.0/24
+--address-prefixes 10.30.0.0/24
+
+# Get AKS node group
+AKS_RESOURCE_GROUP=$(az aks show -g $RESOURCE_GROUP -n $AKS_CLUSTER_NAME --query nodeResourceGroup -o tsv)
 
 PLS_RESOURCE_ID=$(az network private-link-service show -g $AKS_RESOURCE_GROUP -n traefik-lb-private-link --query "id" -o tsv)
 
@@ -314,18 +320,28 @@ az vm create \
 
 # Get the VM public IP address
 VM_IP=$(az vm list-ip-addresses --resource-group $RESOURCE_GROUP --name jumpbox-vm --query '[0].virtualMachine.network.publicIpAddresses[0].ipAddress' -o tsv)
+
+
+
+# Using private endpoint to call the aks service
+# Get network interface for the private endpoint
+PRIVATE_ENDPOINT_NIC_ID=$(az network private-endpoint show -g $RESOURCE_GROUP -n private-endpoint-for-the-aks-pls --query "networkInterfaces[0].id" -o tsv)
+# Get the private endpoint IP
+PRIVATE_ENDPOINT_IP=$(az network nic show --ids $PRIVATE_ENDPOINT_NIC_ID --query "ipConfigurations[0].privateIPAddress" -o tsv)
+
+echo $PRIVATE_ENDPOINT_IP
+
+# TODO: Create a Azure DNS private zone and associate the private endpoint
+# https://docs.microsoft.com/en-us/azure/dns/private-dns-getstarted-cli#create-a-private-dns-zone
+
 # Connect to the vm via ssh
 ssh azureuser@$VM_IP
-curl http://10.240.0.7
-
-# Use private endpoint from the vm
-curl http://10.242.0.4
-
+curl http:/10.30.0.4
+exit
 
 # Get traefik dashboard IP
 TRAEFIK_DASHBOARD_IP=$(kubectl get svc traefik-dashboard-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
 echo http://$TRAEFIK_DASHBOARD_IP:8080
-
 
 # Get ingress IP
 TRAEFIK_INGRESS_CONTROLLER_IP=$(kubectl get svc traefik-web-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
@@ -362,9 +378,6 @@ az afd origin-group create \
 --sample-size 4 \
 --successful-samples-required 3 \
 --additional-latency-in-milliseconds 50
-
-#AKS resource group
-AKS_RESOURCE_GROUP=$(az aks show --resource-group $RESOURCE_GROUP --name $AKS_CLUSTER_NAME --query nodeResourceGroup -o tsv)
 
 # Get the alias for the private link service
 PRIVATE_LINK_ALIAS=$(az network private-link-service show -g $AKS_RESOURCE_GROUP -n traefik-lb-private-link --query "alias" -o tsv)
@@ -403,4 +416,6 @@ az afd route create \
 HOST_NAME=$(az afd endpoint show --resource-group $RESOURCE_GROUP --profile-name $AZURE_FRONT_DOOR_PROFILE_NAME --endpoint-name $ENDPOINT_NAME --query "hostName" -o tsv)
 
 echo http://$HOST_NAME/
-echo http://$HOST_NAME/dashboard
+echo http://$HOST_NAME/dashboard # It doesnt work because the related assets
+
+# Fix network security groups
