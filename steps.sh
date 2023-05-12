@@ -413,9 +413,191 @@ az afd route create \
 --supported-protocols Http \
 --link-to-default-domain Enabled
 
-HOST_NAME=$(az afd endpoint show --resource-group $RESOURCE_GROUP --profile-name $AZURE_FRONT_DOOR_PROFILE_NAME --endpoint-name $ENDPOINT_NAME --query "hostName" -o tsv)
+AFD_HOST_NAME=$(az afd endpoint show --resource-group $RESOURCE_GROUP --profile-name $AZURE_FRONT_DOOR_PROFILE_NAME --endpoint-name $ENDPOINT_NAME --query "hostName" -o tsv)
 
-echo http://$HOST_NAME/
-echo http://$HOST_NAME/dashboard # It doesnt work because the related assets
+echo http://$AFD_HOST_NAME/
+echo http://$AFD_HOST_NAME/dashboard # It doesnt work because the related assets
 
-# Fix network security groups
+################################################
+##### Add custom domains to the endpoint #######
+################################################
+CUSTOM_DOMAIN_NAME="domaingis"
+HOST_NAME="domaingis.com"
+SUBDOMAIN="www"
+
+# Create a custom domain
+az afd custom-domain create \
+--resource-group $RESOURCE_GROUP \
+--custom-domain-name $CUSTOM_DOMAIN_NAME \
+--profile-name $AZURE_FRONT_DOOR_PROFILE_NAME \
+--host-name "$SUBDOMAIN.$HOST_NAME" \
+--minimum-tls-version TLS12 \
+--certificate-type ManagedCertificate
+
+# Get the TXT value to add to the DNS record
+TXT_VALIDATION_TOKEN=$(az afd custom-domain show --resource-group $RESOURCE_GROUP --profile-name $AZURE_FRONT_DOOR_PROFILE_NAME --custom-domain-name $CUSTOM_DOMAIN_NAME --query "validationProperties.validationToken" -o tsv)
+
+# You should add a TXT record to the DNS zone of the custom domain
+echo "Record type: TXT"
+echo "Record name: _dnsauth.$SUBDOMAIN"
+echo "Record value: $TXT_VALIDATION_TOKEN"
+
+# Verify the custom domain
+az afd custom-domain wait \
+--resource-group $RESOURCE_GROUP \
+--profile-name $AZURE_FRONT_DOOR_PROFILE_NAME \
+--custom-domain-name $CUSTOM_DOMAIN_NAME \
+--custom "domainValidationState!='Pending'" \
+--interval 30 --debug
+
+# Get TXT record from a domain
+dig TXT _dnsauth.$SUBDOMAIN.$HOST_NAME
+
+# Associate the custom domain to the endpoint
+az afd route show \
+--resource-group $RESOURCE_GROUP \
+--profile-name $AZURE_FRONT_DOOR_PROFILE_NAME \
+--endpoint-name $ENDPOINT_NAME \
+--route-name traefik-route
+
+# Get all custom domains name configured in a route
+CUSTOM_DOMAINS_ID=$(az afd route show \
+--resource-group $RESOURCE_GROUP \
+--profile-name $AZURE_FRONT_DOOR_PROFILE_NAME \
+--endpoint-name $ENDPOINT_NAME \
+--route-name traefik-route \
+--query "customDomains[].id" -o tsv)
+
+# Get the custom domain names from the IDs (This doesn't work)
+CUSTOM_DOMAINS_NAMES=$(az afd custom-domain show \
+--resource-group $RESOURCE_GROUP \
+--profile-name $AZURE_FRONT_DOOR_PROFILE_NAME \
+--custom-domain-name $CUSTOM_DOMAIN_NAME \
+--ids $CUSTOM_DOMAINS_ID \
+--query "[].name" -o tsv | tr '\n' ' ')
+
+# Add a custom domain to the route
+az afd route update \
+--resource-group $RESOURCE_GROUP \
+--profile-name $AZURE_FRONT_DOOR_PROFILE_NAME \
+--endpoint-name $ENDPOINT_NAME \
+--route-name traefik-route \
+--custom-domains www-azuredemo-es domaingis dev-azuredemo-es
+
+# You should add a CNAME record to the DNS zone of the custom domain
+echo "Record type: CNAME"
+echo "Record name: $SUBDOMAIN"
+echo "Record value: $AFD_HOST_NAME"
+
+# Test the custom domain
+curl http://$SUBDOMAIN.$HOST_NAME/
+
+################################################
+########### Check security policies ############
+################################################
+# A security policy includes a web application firewall (WAF) policy and one or more domains to provide centralized protection for your web applications.
+# https://docs.microsoft.com/en-us/azure/frontdoor/front-door-security-policies
+
+
+#### WAF Policy for www ####
+
+# Create a root waf policy
+GENERAL_WAF_POLICY_NAME="wwwWAFPolicy"
+
+# Create a Azure Front Door policy
+az network front-door waf-policy create \
+--resource-group $RESOURCE_GROUP \
+--name $GENERAL_WAF_POLICY_NAME \
+--mode Prevention \
+--sku Premium_AzureFrontDoor
+
+# Get the WAF policy ID
+GENERAL_WAF_POLICY_ID=$(az network front-door waf-policy show --resource-group $RESOURCE_GROUP --name $GENERAL_WAF_POLICY_NAME --query "id" -o tsv)
+
+# Get custom domains with www
+WWW_CUSTOM_DOMAINS_ID=$(az afd custom-domain list \
+--resource-group $RESOURCE_GROUP \
+--profile-name $AZURE_FRONT_DOOR_PROFILE_NAME \
+--query "[?contains(hostName,'www')].id" -o tsv)
+
+# Glue the WAF policy to the security policy
+GENERAL_SECURITY_POLICY_NAME="www-security-policy"
+az afd security-policy create \
+--security-policy-name $GENERAL_SECURITY_POLICY_NAME \
+--resource-group $RESOURCE_GROUP \
+--profile-name $AZURE_FRONT_DOOR_PROFILE_NAME \
+--waf-policy $GENERAL_WAF_POLICY_ID \
+--domains $(echo $WWW_CUSTOM_DOMAINS_ID | tr '\n' ' ')
+
+#### WAF Policy for dev ####
+
+# Create a WAF policy
+DEV_WAF_POLICY_NAME="devWafPolicy"
+
+# Create a Azure Front Door policy # It doesnt add rulesets :(
+az network front-door waf-policy create \
+--resource-group $RESOURCE_GROUP \
+--name $DEV_WAF_POLICY_NAME \
+--mode Detection \
+--sku Premium_AzureFrontDoor
+
+az network front-door waf-policy managed-rule-definition list -o table
+
+# Add managed rules
+az network front-door waf-policy managed-rules add \
+--resource-group $RESOURCE_GROUP \
+--policy-name $DEV_WAF_POLICY_NAME \
+--type Microsoft_DefaultRuleSet \
+--version 2.1 \
+--action Block
+
+
+# Get the WAF policy ID
+DEV_WAF_POLICY_ID=$(az network front-door waf-policy show --resource-group $RESOURCE_GROUP --name $WAF_POLICY_NAME --query "id" -o tsv)
+
+# Get custom domains with www
+DEV_CUSTOM_DOMAINS_ID=$(az afd custom-domain list \
+--resource-group $RESOURCE_GROUP \
+--profile-name $AZURE_FRONT_DOOR_PROFILE_NAME \
+--query "[?contains(hostName,'dev')].id" -o tsv)
+
+# Create a general security policy
+DEV_SECURITY_POLICY_NAME="dev-security-policy"
+
+# Glue the WAF policy to the security policy
+az afd security-policy create \
+--security-policy-name $DEV_SECURITY_POLICY_NAME \
+--resource-group $RESOURCE_GROUP \
+--profile-name $AZURE_FRONT_DOOR_PROFILE_NAME \
+--waf-policy $DEV_WAF_POLICY_ID \
+--domains $(echo $DEV_CUSTOM_DOMAINS_ID | tr '\n' ' ')
+
+# Check all security policies
+az afd security-policy list \
+--resource-group $RESOURCE_GROUP \
+--profile-name $AZURE_FRONT_DOOR_PROFILE_NAME -o table
+
+# Test WAF in prevention mode
+curl http://www.azuredemo.es?test=alert\(\)
+# SQL Injection
+curl http://www.azuredemo.es?id=1%20or%201=1
+# Suspicious User Agent
+curl -H "User-Agent:javascript:" http://www.azuredemo.es
+# Test custom rule
+curl http://www.azuredemo.es?id=blockme
+
+# Check WAF logs
+az afd waf-log-analytic metric list \
+--date-time-begin 2023-12-05T00:00:00Z \
+--date-time-end 2023-12-05T00:00:00Z \
+
+# Get workspace id for this Azure front door profile
+WORKSPACE_ID=$(az afd log-analytic show \
+--resource-group $RESOURCE_GROUP \
+--profile-name $AZURE_FRONT_DOOR_PROFILE_NAME \
+--query "workspaceId" -o tsv)
+
+
+### Limits ###
+# https://learn.microsoft.com/en-us/azure/frontdoor/front-door-routing-limits
+# https://github.com/MicrosoftDocs/azure-docs/blob/main/includes/front-door-limits.md#azure-front-door-standard-and-premium-tier-service-limits
