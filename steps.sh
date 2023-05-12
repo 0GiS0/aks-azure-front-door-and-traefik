@@ -511,6 +511,39 @@ az network front-door waf-policy create \
 --mode Prevention \
 --sku Premium_AzureFrontDoor
 
+# Add a managed rule to the WAF policy
+az network front-door waf-policy managed-rules add \
+--resource-group $RESOURCE_GROUP \
+--policy-name $GENERAL_WAF_POLICY_NAME \
+--type Microsoft_DefaultRuleSet \
+--version 2.1 \
+--action Block
+
+# Create custom rule
+az network front-door waf-policy rule create \
+--resource-group $RESOURCE_GROUP \
+--policy-name $GENERAL_WAF_POLICY_NAME \
+--name "wwwcustomrule" \
+--priority 1 \
+--rule-type MatchRule \
+--action Block \
+--defer
+
+# Add a condition to the custom rule
+az network front-door waf-policy rule match-condition add \
+--match-variable QueryString \
+--operator Contains \
+--values "blockme" \
+--name wwwcustomrule \
+--resource-group $RESOURCE_GROUP \
+--policy-name $GENERAL_WAF_POLICY_NAME
+
+# Check custom rules
+az network front-door waf-policy rule list \
+--resource-group $RESOURCE_GROUP \
+--policy-name $GENERAL_WAF_POLICY_NAME
+
+
 # Get the WAF policy ID
 GENERAL_WAF_POLICY_ID=$(az network front-door waf-policy show --resource-group $RESOURCE_GROUP --name $GENERAL_WAF_POLICY_NAME --query "id" -o tsv)
 
@@ -534,7 +567,7 @@ az afd security-policy create \
 # Create a WAF policy
 DEV_WAF_POLICY_NAME="devWafPolicy"
 
-# Create a Azure Front Door policy # It doesnt add rulesets :(
+# Create a Azure Front Door policy 
 az network front-door waf-policy create \
 --resource-group $RESOURCE_GROUP \
 --name $DEV_WAF_POLICY_NAME \
@@ -549,7 +582,31 @@ az network front-door waf-policy managed-rules add \
 --policy-name $DEV_WAF_POLICY_NAME \
 --type Microsoft_DefaultRuleSet \
 --version 2.1 \
---action Block
+--action Log
+
+# Add custom rule
+az network front-door waf-policy rule create \
+--resource-group $RESOURCE_GROUP \
+--policy-name $DEV_WAF_POLICY_NAME \
+--name "devcustomrule" \
+--priority 1 \
+--rule-type MatchRule \
+--action Log \
+--defer
+
+# Add a condition to the custom rule
+az network front-door waf-policy rule match-condition add \
+--match-variable QueryString \
+--operator Contains \
+--values "blockme" \
+--name devcustomrule \
+--resource-group $RESOURCE_GROUP \
+--policy-name $DEV_WAF_POLICY_NAME
+
+# Check custom rules
+az network front-door waf-policy rule list \
+--resource-group $RESOURCE_GROUP \
+--policy-name $DEV_WAF_POLICY_NAME
 
 
 # Get the WAF policy ID
@@ -577,25 +634,62 @@ az afd security-policy list \
 --resource-group $RESOURCE_GROUP \
 --profile-name $AZURE_FRONT_DOOR_PROFILE_NAME -o table
 
-# Test WAF in prevention mode
-curl http://www.azuredemo.es?test=alert\(\)
+#########################################################
+####################### WAF tests #######################
+#########################################################
+
+############# devWAFPolicy #############
+
+# SQL Injection
+curl http://dev.azuredemo.es?id=1%20or%201=1
+
+# Test custom rule
+curl http://dev.azuredemo.es?id=blockme
+
+
+# Check logs
+# Get diagnostics for the Front Door
+AZURE_FRONT_DOOR_PROFILE_ID=$(az afd profile show \
+--resource-group $RESOURCE_GROUP \
+--profile-name $AZURE_FRONT_DOOR_PROFILE_NAME \
+--query "id" -o tsv)
+
+WORKSPACE_ID=$(az monitor diagnostic-settings list \
+--resource $AZURE_FRONT_DOOR_PROFILE_ID \
+--query "[].workspaceId" -o tsv)
+
+# Get workspace name
+WORKSPACE_NAME=$(az resource show \
+--ids $WORKSPACE_ID \
+--query "name" -o tsv)
+
+# Get workspace resource group
+WORKSPACE_RESOURCE_GROUP=$(az resource show \
+--ids $WORKSPACE_ID \
+--query "resourceGroup" -o tsv)
+
+# Get workspace GUID
+WORKSPACE_GUID=$(az monitor log-analytics workspace show \
+--workspace-name $WORKSPACE_NAME \
+--resource-group $WORKSPACE_RESOURCE_GROUP \
+--query "customerId" -o tsv)
+
+# Get logs
+az monitor log-analytics query -w $WORKSPACE_GUID --analytics-query "AzureDiagnostics | where Category == 'FrontDoorWebApplicationFirewallLog' | project requestUri_s, ruleName_s, action_s" -o table
+
+
+############ wwwWAFPolicy (Prevention mode) #############
+
 # SQL Injection
 curl http://www.azuredemo.es?id=1%20or%201=1
-# Suspicious User Agent
-curl -H "User-Agent:javascript:" http://www.azuredemo.es
+
 # Test custom rule
 curl http://www.azuredemo.es?id=blockme
 
-# Check WAF logs
-az afd waf-log-analytic metric list \
---date-time-begin 2023-12-05T00:00:00Z \
---date-time-end 2023-12-05T00:00:00Z \
+# SQL Injection
+curl http://www.domaingis.com?id=1%20or%201=1
 
-# Get workspace id for this Azure front door profile
-WORKSPACE_ID=$(az afd log-analytic show \
---resource-group $RESOURCE_GROUP \
---profile-name $AZURE_FRONT_DOOR_PROFILE_NAME \
---query "workspaceId" -o tsv)
+
 
 
 ### Limits ###
